@@ -55,18 +55,19 @@ export function createClient({fetcher = globalThis.fetch, clock = Date.now, time
       }
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), timeout);
+      let response, reader;
       try {
-        const response = await fetcher(ORIGIN+path, {mode:'cors', credentials:'omit', redirect:'error', signal:controller.signal});
+        response = await fetcher(ORIGIN+path, {mode:'cors', credentials:'omit', redirect:'error', signal:controller.signal});
         if (!response.ok || response.type === 'opaque' || response.headers.get('content-type')?.split(';')[0].trim() !== type) throw Error('Unexpected JMA HTTP status/content type');
         const declared = Number(response.headers.get('content-length'));
         if (declared > 2000000) throw Error('Upstream size limit');
-        const reader = response.body.getReader();
+        reader = response.body.getReader();
         const chunks = []; let size = 0;
         while (true) {
           const {done, value} = await reader.read();
           if (done) break;
           size += value.byteLength;
-          if (size > 2000000) { await reader.cancel(); throw Error('Upstream size limit'); }
+          if (size > 2000000) throw Error('Upstream size limit');
           chunks.push(value);
         }
         const bytes = new Uint8Array(size); let offset = 0;
@@ -75,11 +76,22 @@ export function createClient({fetcher = globalThis.fetch, clock = Date.now, time
         cache.set(path, {at:clock(), value});
         return value;
       } catch (cause) {
+        // Abort the transport first, including failures before getReader().
+        // Await cancellation before the shared slot can admit another request.
+        controller.abort();
+        try {
+          if (reader) await reader.cancel();
+          else await response?.body?.cancel();
+        } catch {
+          // An already errored/aborted stream may reject cancellation. The
+          // transport is aborted; preserve the original retrieval failure.
+        }
         const error = Error(`JMA retrieval failed (${cause.name}): ${cause.message}. CORS/network access may be unavailable.`);
         cache.set(path, {at:clock(), error});
         throw error;
       } finally {
         clearTimeout(timer);
+        reader?.releaseLock();
         if (cache.size > 32) cache.delete(cache.keys().next().value);
       }
     };

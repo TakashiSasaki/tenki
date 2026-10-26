@@ -88,3 +88,94 @@ test('malformed JSON, PNG signature and dimensions fail explicitly',async()=>{
   const header=new Uint8Array(24);header.set([137,80,78,71,13,10,26,10]);
   await assert.rejects(decodePng(header),/dimensions/);
 });
+
+// Regression: rejected headers must stop the body before the next slot opens.
+for (const [name, status, type, length] of [
+  ['status', 503, 'application/json', null],
+  ['content type', 200, 'text/html', null],
+  ['declared size', 200, 'application/json', '2000001'],
+]) {
+  test(`rejected ${name} cancels both queued bodies before releasing the slot`, async () => {
+    let active=0, maxActive=0, cancelled=0;
+    const signals=[];
+    const client=createClient({timeout:5, fetcher:async (_url,{signal})=>{
+      signals.push(signal);
+      const stream=new ReadableStream({
+        start() { active++; maxActive=Math.max(maxActive,active); },
+        async cancel() { await new Promise(resolve=>setTimeout(resolve,1)); active--; cancelled++; },
+      });
+      const headers={'content-type':type};
+      if (length) headers['content-length']=length;
+      return new Response(stream,{status,headers});
+    }});
+    const results=await Promise.allSettled([
+      client.read('/rejected-a','application/json'),client.read('/rejected-b','application/json'),
+    ]);
+    assert.ok(results.every(r=>r.status==='rejected'));
+    assert.equal(active,0);
+    assert.equal(cancelled,2);
+    assert.equal(maxActive,1);
+    assert.ok(signals.every(s=>s.aborted));
+  });
+}
+test('streaming overrun cancels locked reader and aborts before slot recovery',async()=>{
+  let cancelled=0, calls=0, badSignal;
+  const client=createClient({fetcher:async(_url,{signal})=>{
+    if (++calls>1) { assert.equal(cancelled,1); assert.equal(badSignal.aborted,true); return response(); }
+    badSignal=signal;
+    return new Response(new ReadableStream({
+      start(controller) { controller.enqueue(new Uint8Array(2000001)); },
+      cancel() { cancelled++; },
+    }),{headers:{'content-type':'application/json'}});
+  }});
+  const [bad,good]=await Promise.allSettled([client.read('/oversize','application/json'),client.read('/good','application/json')]);
+  assert.equal(bad.status,'rejected'); assert.match(bad.reason.message,/size limit/);
+  assert.equal(good.status,'fulfilled'); assert.equal(cancelled,1);
+});
+test('read error aborts even if cancelling the errored stream rejects; slot recovers',async()=>{
+  let calls=0, badSignal;
+  const client=createClient({fetcher:async(_url,{signal})=>{
+    if (++calls>1) { assert.equal(badSignal.aborted,true); return response(); }
+    badSignal=signal;
+    return new Response(new ReadableStream({
+      start(controller) { controller.error(Error('stream read failed')); },
+    }),{headers:{'content-type':'application/json'}});
+  }});
+  await assert.rejects(client.read('/read-error','application/json'),/stream read failed/);
+  assert.equal((await client.read('/recovery','application/json')).cached,false);
+});
+test('header rejection tolerates cancellation failure without losing original error',async()=>{
+  let signal;
+  const client=createClient({fetcher:async(_url,options)=>{
+    signal=options.signal;
+    return new Response(new ReadableStream({cancel(){throw Error('cancel failed');}}),{status:503});
+  }});
+  await assert.rejects(client.read('/bad','application/json'),/HTTP status\/content type/);
+  assert.equal(signal.aborted,true);
+});
+test('deadline during body read terminates transfer before queued request starts',async()=>{
+  let active=0, calls=0, badSignal;
+  const client=createClient({timeout:5,fetcher:async(_url,{signal})=>{
+    if (++calls>1) { assert.equal(active,0); assert.equal(badSignal.aborted,true); return response(); }
+    badSignal=signal;
+    return new Response(new ReadableStream({
+      start(controller) {
+        active++;
+        signal.addEventListener('abort',()=>{active--; controller.error(new DOMException('body timeout','AbortError'));},{once:true});
+      },
+    }),{headers:{'content-type':'application/json'}});
+  }});
+  const [bad,good]=await Promise.allSettled([client.read('/slow-body','application/json'),client.read('/next','application/json')]);
+  assert.equal(bad.status,'rejected'); assert.match(bad.reason.message,/AbortError/);
+  assert.equal(good.status,'fulfilled'); assert.equal(active,0);
+});
+test('decode failure occurs after bounded body completion and does not poison the slot',async()=>{
+  const signals=[];
+  const client=createClient({fetcher:async(url,{signal})=>{
+    signals.push(signal);
+    return url.endsWith('.json') ? response(JSON.stringify([ROW])) : response('not PNG','image/png');
+  }});
+  await assert.rejects(snapshot(33.84,132.77,'analysis',0,client,{now:NOW}),/PNG signature/);
+  assert.equal((await client.read('/next.json','application/json')).cached,false);
+  assert.ok(signals.every(s=>!s.aborted)); // Completely consumed successes need no abort.
+});
