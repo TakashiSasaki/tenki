@@ -54,17 +54,26 @@ export function createClient({fetcher = globalThis.fetch, clock = Date.now, time
         return {...old.value, cached:true};
       }
       const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeout);
+      const deadlineError = new DOMException('JMA request deadline exceeded', 'AbortError');
+      let rejectDeadline;
+      const deadline = new Promise((_, reject) => { rejectDeadline = reject; });
+      const timer = setTimeout(() => {
+        rejectDeadline(deadlineError);
+        controller.abort();
+      }, timeout);
+      // Reuse the original deadline for fetch, reads and cleanup; never start
+      // another timeout that could extend the request's total slot occupancy.
+      const bounded = operation => Promise.race([operation, deadline]);
       let response, reader;
       try {
-        response = await fetcher(ORIGIN+path, {mode:'cors', credentials:'omit', redirect:'error', signal:controller.signal});
+        response = await bounded(Promise.resolve().then(() => fetcher(ORIGIN+path, {mode:'cors', credentials:'omit', redirect:'error', signal:controller.signal})));
         if (!response.ok || response.type === 'opaque' || response.headers.get('content-type')?.split(';')[0].trim() !== type) throw Error('Unexpected JMA HTTP status/content type');
         const declared = Number(response.headers.get('content-length'));
         if (declared > 2000000) throw Error('Upstream size limit');
         reader = response.body.getReader();
         const chunks = []; let size = 0;
         while (true) {
-          const {done, value} = await reader.read();
+          const {done, value} = await bounded(reader.read());
           if (done) break;
           size += value.byteLength;
           if (size > 2000000) throw Error('Upstream size limit');
@@ -77,16 +86,23 @@ export function createClient({fetcher = globalThis.fetch, clock = Date.now, time
         return value;
       } catch (cause) {
         // Abort the transport first, including failures before getReader().
-        // Await cancellation before the shared slot can admit another request.
+        // Wait for body cancellation only within this request's original deadline.
         controller.abort();
-        try {
-          if (reader) await reader.cancel();
-          else await response?.body?.cancel();
-        } catch {
-          // An already errored/aborted stream may reject cancellation. The
-          // transport is aborted; preserve the original retrieval failure.
+        let cleanup_status = 'no_body';
+        if (reader || response?.body) {
+          try {
+            await bounded(Promise.resolve().then(() => reader ? reader.cancel() : response.body.cancel()));
+            cleanup_status = 'cancel_confirmed';
+          } catch (cleanupError) {
+            // Promise.race observes late rejection too; do not claim completion
+            // if cancellation rejected or exceeded the original deadline.
+            cleanup_status = cleanupError === deadlineError ? 'cancel_unconfirmed' : 'cancel_failed';
+          }
         }
-        const error = Error(`JMA retrieval failed (${cause.name}): ${cause.message}. CORS/network access may be unavailable.`);
+        const cleanupNote = ['cancel_unconfirmed', 'cancel_failed'].includes(cleanup_status)
+          ? ' Body cancellation requested; completion unconfirmed.' : '';
+        const error = Error(`JMA retrieval failed (${cause.name}): ${cause.message}. CORS/network access may be unavailable.${cleanupNote}`);
+        error.cleanup_status = cleanup_status;
         cache.set(path, {at:clock(), error});
         throw error;
       } finally {

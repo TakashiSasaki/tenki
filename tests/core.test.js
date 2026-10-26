@@ -98,7 +98,7 @@ for (const [name, status, type, length] of [
   test(`rejected ${name} cancels both queued bodies before releasing the slot`, async () => {
     let active=0, maxActive=0, cancelled=0;
     const signals=[];
-    const client=createClient({timeout:5, fetcher:async (_url,{signal})=>{
+    const client=createClient({fetcher:async (_url,{signal})=>{
       signals.push(signal);
       const stream=new ReadableStream({
         start() { active++; maxActive=Math.max(maxActive,active); },
@@ -112,6 +112,7 @@ for (const [name, status, type, length] of [
       client.read('/rejected-a','application/json'),client.read('/rejected-b','application/json'),
     ]);
     assert.ok(results.every(r=>r.status==='rejected'));
+    assert.ok(results.every(r=>r.reason.cleanup_status==='cancel_confirmed'));
     assert.equal(active,0);
     assert.equal(cancelled,2);
     assert.equal(maxActive,1);
@@ -150,7 +151,7 @@ test('header rejection tolerates cancellation failure without losing original er
     signal=options.signal;
     return new Response(new ReadableStream({cancel(){throw Error('cancel failed');}}),{status:503});
   }});
-  await assert.rejects(client.read('/bad','application/json'),/HTTP status\/content type/);
+  await assert.rejects(client.read('/bad','application/json'),error=>error.cleanup_status==='cancel_failed' && /HTTP status\/content type/.test(error.message));
   assert.equal(signal.aborted,true);
 });
 test('deadline during body read terminates transfer before queued request starts',async()=>{
@@ -178,4 +179,95 @@ test('decode failure occurs after bounded body completion and does not poison th
   await assert.rejects(snapshot(33.84,132.77,'analysis',0,client,{now:NOW}),/PNG signature/);
   assert.equal((await client.read('/next.json','application/json')).cached,false);
   assert.ok(signals.every(s=>!s.aborted)); // Completely consumed successes need no abort.
+});
+
+async function within(pending, milliseconds=150) {
+  let timer;
+  try { return await Promise.race([pending,new Promise((_,reject)=>{timer=setTimeout(()=>reject(Error('Test guard: request slot remained blocked')),milliseconds);})]); }
+  finally { clearTimeout(timer); }
+}
+for (const kind of ['header','overrun']) {
+  test(`stalled ${kind} cancellation is bounded and the queue recovers`,async()=>{
+    let calls=0, cancellations=0, signal, body;
+    const client=createClient({timeout:5,fetcher:async(_url,options)=>{
+      if (++calls>1) { assert.ok(signal.aborted); return response(); }
+      signal=options.signal;
+      body=new ReadableStream({
+        start(controller) { if(kind==='overrun') controller.enqueue(new Uint8Array(2000001)); },
+        cancel() { cancellations++; return new Promise(()=>{}); },
+      });
+      return new Response(body,{status:kind==='header'?503:200,headers:{'content-type':'application/json'}});
+    }});
+    const [bad,good]=await within(Promise.allSettled([client.read('/stalled','application/json'),client.read('/recovery','application/json')]));
+    assert.equal(bad.status,'rejected'); assert.equal(good.status,'fulfilled');
+    assert.match(bad.reason.message,kind==='header'?/HTTP status\/content type/:/size limit/);
+    assert.equal(bad.reason.cleanup_status,'cancel_unconfirmed');
+    assert.match(bad.reason.message,/completion unconfirmed/);
+    assert.equal(cancellations,1);assert.equal(calls,2);assert.equal(signal.aborted,true);assert.equal(body.locked,false);
+    await assert.rejects(client.read('/stalled','application/json'),error=>error===bad.reason);
+    assert.equal(calls,2);
+  });
+}
+
+test('fetch and cleanup share one overall deadline, with timer cleared on exit',async t=>{
+  const timers=[];
+  t.mock.method(globalThis,'setTimeout',(callback,delay)=>{const timer={callback,delay,cleared:false};timers.push(timer);return timer;});
+  t.mock.method(globalThis,'clearTimeout',timer=>{timer.cleared=true;});
+  let resolveFetch, cancellations=0;
+  const client=createClient({timeout:5,fetcher:()=>new Promise(resolve=>{resolveFetch=resolve;})});
+  const pending=client.read('/delayed-headers','application/json');
+  const outcome=pending.catch(error=>error);
+  await new Promise(setImmediate);
+  assert.equal(timers.length,1); assert.equal(timers[0].delay,5);
+  resolveFetch(new Response(new ReadableStream({cancel(){cancellations++;return new Promise(()=>{});}}),{status:503}));
+  await new Promise(setImmediate);
+  assert.equal(cancellations,1); assert.equal(timers.length,1); // Cleanup gets no fresh deadline.
+  timers[0].callback();
+  const error=await outcome;
+  assert.match(error.message,/HTTP status\/content type/);
+  assert.equal(error.cleanup_status,'cancel_unconfirmed');
+  assert.equal(timers[0].cleared,true);
+});
+test('a body read ignoring abort is still bounded, reader unlocked and slot recovered',async()=>{
+  let calls=0, body, signal;
+  const client=createClient({timeout:5,fetcher:async(_url,options)=>{
+    if (++calls>1) return response();
+    signal=options.signal;
+    body=new ReadableStream({cancel(){return new Promise(()=>{});}});
+    return new Response(body,{headers:{'content-type':'application/json'}});
+  }});
+  const [bad,good]=await within(Promise.allSettled([client.read('/stuck-read','application/json'),client.read('/next','application/json')]));
+  assert.equal(bad.status,'rejected');assert.match(bad.reason.message,/deadline exceeded/);
+  assert.equal(bad.reason.cleanup_status,'cancel_unconfirmed');
+  assert.equal(good.status,'fulfilled');assert.equal(body.locked,false);assert.equal(signal.aborted,true);
+});
+test('late cancellation rejection is observed after deadline and cannot poison recovery',async()=>{
+  let calls=0, rejectCancel;
+  const client=createClient({timeout:5,fetcher:async()=>{
+    if (++calls>1) return response();
+    return new Response(new ReadableStream({cancel(){return new Promise((_,reject)=>{rejectCancel=reject;});}}),{status:503});
+  }});
+  await assert.rejects(within(client.read('/late-cancel','application/json')),error=>error.cleanup_status==='cancel_unconfirmed');
+  rejectCancel(Error('late cancellation rejection'));
+  await new Promise(setImmediate); // node:test also detects any unhandled rejection.
+  assert.equal((await client.read('/next','application/json')).cached,false);
+});
+test('successful completion clears its timer and never later aborts its signal',async()=>{
+  let signal;
+  const client=createClient({timeout:5,fetcher:async(_url,options)=>{signal=options.signal;return response();}});
+  await client.read('/success','application/json');
+  await new Promise(resolve=>setTimeout(resolve,15));
+  assert.equal(signal.aborted,false);
+  assert.equal((await client.read('/success','application/json')).cached,true);
+});
+
+test('a fetch ignoring abort cannot hold the request slot past its deadline',async()=>{
+  let calls=0, signal;
+  const client=createClient({timeout:5,fetcher:(_url,options)=>{
+    if (++calls>1) return Promise.resolve(response());
+    signal=options.signal; return new Promise(()=>{});
+  }});
+  const [bad,good]=await within(Promise.allSettled([client.read('/stuck-fetch','application/json'),client.read('/next','application/json')]));
+  assert.equal(bad.status,'rejected');assert.match(bad.reason.message,/deadline exceeded/);
+  assert.equal(good.status,'fulfilled');assert.equal(signal.aborted,true);
 });
