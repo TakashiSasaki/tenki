@@ -1,0 +1,1 @@
+# No Python production dependencies: the application is static.
