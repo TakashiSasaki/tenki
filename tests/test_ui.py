@@ -24,7 +24,8 @@ def static_site(tmp_path):
     import shutil
     shutil.copytree(ROOT/'dist',tmp_path/'tenki')
     for item in (ROOT/'dist').iterdir():
-        shutil.copy2(item,tmp_path/item.name)
+        if item.is_dir(): shutil.copytree(item,tmp_path/item.name)
+        else: shutil.copy2(item,tmp_path/item.name)
     server=ThreadingHTTPServer(('127.0.0.1',0),partial(QuietStatic,directory=str(tmp_path)))
     threading.Thread(target=server.serve_forever,daemon=True).start()
     yield f'http://127.0.0.1:{server.server_port}/tenki/'
@@ -105,3 +106,31 @@ def test_static_nonzero_states_and_staleness(browser,static_site,color,label):
     page.get_by_role('heading').filter(has_text=label).wait_for()
     assert '古いデータ' in page.locator('#details').inner_text()
     page.close()
+
+
+def test_pwa_assets_and_cache_free_worker(browser,static_site):
+    page=browser.new_page()
+    page.goto(static_site)
+    assert page.locator('link[rel="manifest"]').get_attribute('href') == './manifest.webmanifest'
+    result=page.evaluate("""async () => {
+      const reg=await navigator.serviceWorker.ready;
+      const manifest=await (await fetch('./manifest.webmanifest')).json();
+      const icons=await Promise.all(manifest.icons.map(i=>fetch(i.src).then(r=>r.ok)));
+      return {scope:reg.scope,icons,manifest,cacheKeys:await caches.keys()};
+    }""")
+    assert result['scope'].endswith('/tenki/')
+    assert all(result['icons'])
+    assert result['manifest']['display']=='standalone'
+    assert result['cacheKeys']==[]
+    assert page.request.get(static_site+'icons/social.png').ok
+    page.close()
+
+def test_pwa_icon_dimensions_and_manifest_references():
+    manifest=json.loads((ROOT/'dist/manifest.webmanifest').read_text())
+    expected={'icon-192.png':(192,192),'icon-512.png':(512,512),'icon-180.png':(180,180),'icon-32.png':(32,32),'social.png':(1200,630)}
+    for name,dimensions in expected.items():
+        with Image.open(ROOT/'dist/icons'/name) as img:
+            assert img.size==dimensions and img.format=='PNG'
+    for icon in manifest['icons']:
+        assert (ROOT/'dist'/icon['src']).is_file()
+        assert icon['purpose']=='any maskable'

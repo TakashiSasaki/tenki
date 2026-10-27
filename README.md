@@ -10,12 +10,12 @@ Node.js 22以上（テスト／ファイルコピー用。本番ランタイム�
 npm ci
 npm test
 npm run build
-# dist/ の4ファイルが静的公開用成果物
+# dist/ が静的公開用成果物
 python3 -m http.server 8000 --bind 127.0.0.1 --directory dist
 # http://127.0.0.1:8000
 ```
 
-この標準静的サーバーはローカル確認専用です。アプリ独自のHTTPサーバーや `/api/rain` はありません。`file://` ではなく HTTP(S) で開いてください。すべてのアセットとモジュール参照は相対パスなので、カスタムドメインのルートでも `/tenki/` のようなサブパスでも配信できます。`dist/` を GitHub Pages 等へ配置できますが、公開 workflow・DNS・Pages設定の変更はこの PR に含めません。
+この標準静的サーバーはローカル確認専用です。アプリ独自のHTTPサーバーや `/api/rain` はありません。`file://` ではなく HTTP(S) で開いてください。すべてのアセットとモジュール参照は相対パスなので、カスタムドメインのルートでも `/tenki/` のようなサブパスでも配信できます。`dist/` を GitHub Pages 等へ配置できますが、mainへのpush後、テスト成功時に GitHub Actions の Pages workflow が公開します。DNS・Pages設定は変更しません。
 
 ブラウザーテスト（JMA応答はすべてオフラインのモック）：
 
@@ -29,7 +29,7 @@ npm run build
 # TENKI_CHROMIUM=/usr/bin/chromium .venv/bin/python -m pytest -q
 ```
 
-Node の共有ロジックテストは時刻・座標・境界・パレット・5分キャッシュ・取得失敗・HTTP検証・容量制限・timeout・直列化を確認します。Playwright はビルド済みの静的ファイルだけを配信して、モバイル、サブパス、匿名クロスオリジン取得、更新失敗、CORS拒否と canvas `SecurityError` を確認します。Python/Pillow/Playwright はテスト専用で、推移依存も固定済みです。CIも静的ビルドと同じオフラインテストを実行し、成功時に `tenki-static` artifact（7日保持）を添付します。公開処理は行いません。
+Node の共有ロジックテストは時刻・座標・境界・パレット・5分キャッシュ・取得失敗・HTTP検証・容量制限・timeout・直列化を確認します。Playwright はビルド済みの静的ファイルだけを配信して、モバイル、サブパス、匿名クロスオリジン取得、更新失敗、CORS拒否と canvas `SecurityError` を確認します。Python/Pillow/Playwright はテスト専用で、推移依存も固定済みです。CIも静的ビルドと同じオフラインテストを実行し、成功時に `tenki-static` artifact（7日保持）を添付します。PRでは公開せず、mainのテスト成功後に公開します。
 
 ## データと表示
 
@@ -71,3 +71,9 @@ fetch は `mode: cors`, `credentials: omit`、独自ヘッダーなしの単純 
 出典：[気象庁](https://www.jma.go.jp/bosai/nowc/)／本アプリが加工。[利用規約](https://www.jma.go.jp/jma/kishou/info/coment.html)。防災判断には気象庁の最新情報をご確認ください。
 
 [tenki.jp](https://tenki.jp/radar/map/) と [Yahoo!天気](https://weather.yahoo.co.jp/weather/zoomradar/?pref=38) は通常の外部リンクのみ。タイル転載・自動収集・iframe・Yahoo API連携はありません。リンク先で地域や時間を確認してください。
+
+## PWA と公開
+
+マニフェストと登録専用のサービスワーカーを用意しています。サービスワーカーは fetch 処理、Cache Storage、バックグラウンド取得を行いません。オフラインでのアプリ起動や最新気象データの取得は保証されません。既存の5分キャッシュは各ページのメモリーに限られます。インストール条件はブラウザーにより異なり、Chromeではサービスワーカーの fetch handler は必須ではありません。HTTPS（または開発時localhost）が必要です。実機インストールと公開ドメインでの動作は未確認です。
+
+`assets/icon.svg` と `assets/social.svg` はオリジナルの原本です。Inkscape 1.4 で `scripts/generate-icons.sh` を実行し、192/512、Apple 180、favicon 32、1200×630 を生成します。maskable用の図形は中央の安全領域に収めています。mainへのpush時のみ、テスト成功後にPages artifact を作成し、最小権限で公開します。GitHub Pages の公開元が GitHub Actions に設定されている必要があります。
